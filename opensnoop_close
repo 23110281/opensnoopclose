@@ -1,0 +1,526 @@
+#!/usr/bin/env python
+# @lint-avoid-python-3-compatibility-imports
+#
+# Opensnoopclose Trace open() and close() syscalls.
+#           For Linux, uses BCC, eBPF. Embedded C.
+#
+# USAGE: closesnoop [-h] [-T] [-U] [-p PID] [-t TID]
+#                   [--cgroupmap CGROUPMAP] [--mntnsmap MNTNSMAP] [-u UID]
+#                   [-d DURATION] [-n NAME] [-F]
+#                   [-b BUFFER_PAGES]
+#
+# Based on opensnoop by Brendan Gregg.
+#
+# 17-Sep-2015   Brendan Gregg   Created opensnoop.
+# 17-Sep-2026   Rudra Singh     Extended opensnoop.
+
+from __future__ import print_function
+from bcc import ArgString, BPF
+from bcc.containers import filter_by_containers
+from bcc.utils import printb
+import argparse
+from collections import defaultdict
+from datetime import datetime, timedelta
+import os
+from pathlib import Path
+from incremental_adler import calculate_full_adler32
+
+# arguments
+examples = """examples:
+    ./closesnoop           # trace all close() syscalls with Adler32 check
+    ./closesnoop -T        # include timestamps
+    ./closesnoop -U        # include UID
+    ./closesnoop -p 181    # only trace PID 181
+    ./closesnoop -t 123    # only trace TID 123
+    ./closesnoop -u 1000   # only trace UID 1000
+    ./closesnoop -d 10     # trace for 10 seconds only
+    ./closesnoop -n main   # only print process names containing "main"
+    ./closesnoop -F        # show full path for closed files
+    ./closesnoop --cgroupmap mappath   # only trace cgroups in this BPF map
+    ./closesnoop --mntnsmap mappath   # only trace mount namespaces in the map
+"""
+parser = argparse.ArgumentParser(
+    description="Trace close() syscalls and check file integrity with Adler32",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=examples)
+parser.add_argument("-T", "--timestamp", action="store_true",
+    help="include timestamp on output")
+parser.add_argument("-U", "--print-uid", action="store_true",
+    help="print UID column")
+parser.add_argument("-p", "--pid",
+    help="trace this PID only")
+parser.add_argument("-t", "--tid",
+    help="trace this TID only")
+parser.add_argument("--cgroupmap",
+    help="trace cgroups in this BPF map only")
+parser.add_argument("--mntnsmap",
+    help="trace mount namespaces in this BPF map only")
+parser.add_argument("-u", "--uid",
+    help="trace this UID only")
+parser.add_argument("-d", "--duration",
+    help="total duration of trace in seconds")
+parser.add_argument("-n", "--name",
+    type=ArgString,
+    help="only print process names containing this name")
+parser.add_argument("--ebpf", action="store_true",
+    help=argparse.SUPPRESS)
+parser.add_argument("-F", "--full-path", action="store_true",
+    help="show full path for a closed file")
+parser.add_argument("-b", "--buffer-pages", type=int, default=64,
+    help="size of the perf ring buffer "
+         "(must be a power of two number of pages and defaults to 64)")
+args = parser.parse_args()
+debug = 0
+if args.duration:
+    args.duration = timedelta(seconds=int(args.duration))
+
+# define BPF program
+bpf_text = """
+#include <uapi/linux/ptrace.h>
+#include <uapi/linux/limits.h>
+#include <linux/sched.h>
+
+// Define a unified event type enum
+enum event_type {
+    EVENT_OPEN,
+    EVENT_CLOSE,
+    EVENT_ENTRY, // For fullpath
+    EVENT_END,   // For fullpath
+};
+
+struct val_t {
+    u64 id;
+    char comm[TASK_COMM_LEN];
+    const char *fname;
+};
+
+struct data_t {
+    u64 id;
+    u64 ts;
+    u32 uid;
+    int ret;
+    char comm[TASK_COMM_LEN];
+    enum event_type type;
+    char name[NAME_MAX];
+};
+
+#ifdef FULLPATH
+#include <linux/fs_struct.h>
+#include <linux/dcache.h>
+#define MAX_ENTRIES 32
+#endif
+
+BPF_PERF_OUTPUT(events);
+
+int trace_entry_close(struct pt_regs *ctx, int fd){
+    u64 id = bpf_get_current_pid_tgid();
+    u32 pid = id >> 32;
+    u32 tid = id;
+    u32 uid = bpf_get_current_uid_gid();
+
+    // Apply filters
+    PID_TID_FILTER
+    UID_FILTER
+    if (container_should_be_filtered()) {
+        return 0;
+    }
+
+    struct data_t data = {};
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+
+    data.id = id;
+    data.ts = bpf_ktime_get_ns() / 1000;
+    data.uid = uid;
+    data.ret = fd; // For close events, ret is the file descriptor
+    data.type = EVENT_CLOSE;
+    __builtin_memset(data.name, 0, sizeof(data.name));
+
+    events.perf_submit(ctx, &data, sizeof(data));
+
+    return 0;
+}
+"""
+
+bpf_text_kprobe = """
+BPF_HASH(infotmp, u64, struct val_t);
+
+int trace_return(struct pt_regs *ctx)
+{
+    u64 id = bpf_get_current_pid_tgid();
+    struct val_t *valp;
+    struct data_t data = {};
+
+    u64 tsp = bpf_ktime_get_ns();
+
+    valp = infotmp.lookup(&id);
+    if (valp == 0) {
+        // missed entry
+        return 0;
+    }
+
+    bpf_probe_read_kernel(&data.comm, sizeof(data.comm), valp->comm);
+    bpf_probe_read_user_str(&data.name, sizeof(data.name), (void *)valp->fname);
+    data.id = valp->id;
+    data.ts = tsp / 1000;
+    data.uid = bpf_get_current_uid_gid();
+    data.ret = PT_REGS_RC(ctx);
+    data.type = EVENT_OPEN;
+
+    SUBMIT_DATA
+
+    infotmp.delete(&id);
+
+    return 0;
+}
+"""
+
+bpf_text_kprobe_header_open = """
+int syscall__trace_entry_open(struct pt_regs *ctx, const char __user *filename, int flags)
+{
+"""
+
+bpf_text_kprobe_header_openat = """
+int syscall__trace_entry_openat(struct pt_regs *ctx, int dfd, const char __user *filename, int flags)
+{
+"""
+
+bpf_text_kprobe_header_openat2 = """
+#include <uapi/linux/openat2.h>
+int syscall__trace_entry_openat2(struct pt_regs *ctx, int dfd, const char __user *filename, struct open_how *how)
+{
+    int flags = how->flags;
+"""
+
+bpf_text_kprobe_body = """
+    struct val_t val = {};
+    u64 id = bpf_get_current_pid_tgid();
+    u32 pid = id >> 32; // PID is higher part
+    u32 tid = id;       // Cast and get the lower part
+    u32 uid = bpf_get_current_uid_gid();
+
+    PID_TID_FILTER
+    UID_FILTER
+
+    if (container_should_be_filtered()) {
+        return 0;
+    }
+
+    if (bpf_get_current_comm(&val.comm, sizeof(val.comm)) == 0) {
+        val.id = id;
+        val.fname = filename;
+        infotmp.update(&id, &val);
+    }
+
+    return 0;
+};
+"""
+
+bpf_text_kfunc_header_open = """
+#if defined(CONFIG_ARCH_HAS_SYSCALL_WRAPPER) && !defined(__s390x__)
+KRETFUNC_PROBE(FNNAME, struct pt_regs *regs, int ret)
+{
+    const char __user *filename = (char *)PT_REGS_PARM1(regs);
+    int flags = PT_REGS_PARM2(regs);
+#else
+KRETFUNC_PROBE(FNNAME, const char __user *filename, int flags, int ret)
+{
+#endif
+"""
+
+bpf_text_kfunc_header_openat = """
+#if defined(CONFIG_ARCH_HAS_SYSCALL_WRAPPER) && !defined(__s390x__)
+KRETFUNC_PROBE(FNNAME, struct pt_regs *regs, int ret)
+{
+    int dfd = PT_REGS_PARM1(regs);
+    const char __user *filename = (char *)PT_REGS_PARM2(regs);
+    int flags = PT_REGS_PARM3(regs);
+#else
+KRETFUNC_PROBE(FNNAME, int dfd, const char __user *filename, int flags, int ret)
+{
+#endif
+"""
+
+bpf_text_kfunc_header_openat2 = """
+#include <uapi/linux/openat2.h>
+#if defined(CONFIG_ARCH_HAS_SYSCALL_WRAPPER) && !defined(__s390x__)
+KRETFUNC_PROBE(FNNAME, struct pt_regs *regs, int ret)
+{
+    int dfd = PT_REGS_PARM1(regs);
+    const char __user *filename = (char *)PT_REGS_PARM2(regs);
+    struct open_how __user how;
+    int flags;
+
+    bpf_probe_read_user(&how, sizeof(struct open_how), (struct open_how*)PT_REGS_PARM3(regs));
+    flags = how.flags;
+#else
+KRETFUNC_PROBE(FNNAME, int dfd, const char __user *filename, struct open_how __user *how, int ret)
+{
+    int flags = how->flags;
+#endif
+"""
+
+bpf_text_kfunc_body = """
+    u64 id = bpf_get_current_pid_tgid();
+    u32 pid = id >> 32; // PID is higher part
+    u32 tid = id;       // Cast and get the lower part
+    u32 uid = bpf_get_current_uid_gid();
+
+    PID_TID_FILTER
+    UID_FILTER
+    if (container_should_be_filtered()) {
+        return 0;
+    }
+
+    struct data_t data = {};
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+
+    u64 tsp = bpf_ktime_get_ns();
+
+    bpf_probe_read_user_str(&data.name, sizeof(data.name), (void *)filename);
+    data.id    = id;
+    data.ts    = tsp / 1000;
+    data.uid   = bpf_get_current_uid_gid();
+    data.ret   = ret;
+    data.type = EVENT_OPEN;
+
+    SUBMIT_DATA
+
+    return 0;
+}
+"""
+
+b = BPF(text='')
+# open and openat are always in place since 2.6.16
+fnname_open = b.get_syscall_prefix().decode() + 'open'
+fnname_openat = b.get_syscall_prefix().decode() + 'openat'
+fnname_openat2 = b.get_syscall_prefix().decode() + 'openat2'
+if b.ksymname(fnname_openat2) == -1:
+    fnname_openat2 = None
+
+if args.full_path:
+    bpf_text = "#define FULLPATH\n" + bpf_text
+
+is_support_kfunc = BPF.support_kfunc()
+if is_support_kfunc:
+    bpf_text += bpf_text_kfunc_header_open.replace('FNNAME', fnname_open)
+    bpf_text += bpf_text_kfunc_body
+
+    bpf_text += bpf_text_kfunc_header_openat.replace('FNNAME', fnname_openat)
+    bpf_text += bpf_text_kfunc_body
+
+    if fnname_openat2:
+        bpf_text += bpf_text_kfunc_header_openat2.replace('FNNAME', fnname_openat2)
+        bpf_text += bpf_text_kfunc_body
+else:
+    bpf_text += bpf_text_kprobe
+
+    bpf_text += bpf_text_kprobe_header_open
+    bpf_text += bpf_text_kprobe_body
+
+    bpf_text += bpf_text_kprobe_header_openat
+    bpf_text += bpf_text_kprobe_body
+
+    if fnname_openat2:
+        bpf_text += bpf_text_kprobe_header_openat2
+        bpf_text += bpf_text_kprobe_body
+
+if args.tid:  # TID trumps PID
+    bpf_text = bpf_text.replace('PID_TID_FILTER',
+        'if (tid != %s) { return 0; }' % args.tid)
+elif args.pid:
+    bpf_text = bpf_text.replace('PID_TID_FILTER',
+        'if (pid != %s) { return 0; }' % args.pid)
+else:
+    bpf_text = bpf_text.replace('PID_TID_FILTER', '')
+if args.uid:
+    bpf_text = bpf_text.replace('UID_FILTER',
+        'if (uid != %s) { return 0; }' % args.uid)
+else:
+    bpf_text = bpf_text.replace('UID_FILTER', '')
+bpf_text = filter_by_containers(args) + bpf_text
+
+if args.full_path:
+    bpf_text = bpf_text.replace('SUBMIT_DATA', """
+    data.type = EVENT_ENTRY;
+    events.perf_submit(ctx, &data, sizeof(data));
+
+    if (data.name[0] != '/') { // relative path
+        struct task_struct *task;
+        struct dentry *dentry;
+        int i;
+
+        task = (struct task_struct *)bpf_get_current_task_btf();
+        dentry = task->fs->pwd.dentry;
+
+        for (i = 1; i < MAX_ENTRIES; i++) {
+            bpf_probe_read_kernel(&data.name, sizeof(data.name), (void *)dentry->d_name.name);
+            data.type = EVENT_ENTRY;
+            events.perf_submit(ctx, &data, sizeof(data));
+
+            if (dentry == dentry->d_parent) { // root directory
+                break;
+            }
+
+            dentry = dentry->d_parent;
+        }
+    }
+
+    data.type = EVENT_END;
+    events.perf_submit(ctx, &data, sizeof(data));
+    """)
+else:
+    bpf_text = bpf_text.replace('SUBMIT_DATA', """
+    events.perf_submit(ctx, &data, sizeof(data));
+    """)
+
+if debug or args.ebpf:
+    print(bpf_text)
+    if args.ebpf:
+        exit()
+
+# initialize BPF
+b = BPF(text=bpf_text)
+fnname_close = b.get_syscall_fnname("close")
+if not is_support_kfunc:
+    b.attach_kprobe(event=fnname_open, fn_name="syscall__trace_entry_open")
+    b.attach_kretprobe(event=fnname_open, fn_name="trace_return")
+
+    b.attach_kprobe(event=fnname_openat, fn_name="syscall__trace_entry_openat")
+    b.attach_kretprobe(event=fnname_openat, fn_name="trace_return")
+
+    if fnname_openat2:
+        b.attach_kprobe(event=fnname_openat2, fn_name="syscall__trace_entry_openat2")
+        b.attach_kretprobe(event=fnname_openat2, fn_name="trace_return")
+
+b.attach_kprobe(event=fnname_close, fn_name="trace_entry_close")
+
+initial_ts = 0
+
+# header
+if args.timestamp:
+    print("%-14s" % ("TIME(s)"), end="")
+if args.print_uid:
+    print("%-6s" % ("UID"), end="")
+print("%-6s %-16s %-7s %4s %3s %-10s %-22s" %
+      ("TID" if args.tid else "PID", "COMM", "EVENT", "FD", "ERR", "ADLER32", "STATUS"), end="")
+print("PATH")
+
+
+class EventType(object):
+    EVENT_OPEN = 0
+    EVENT_CLOSE = 1
+    EVENT_ENTRY = 2
+    EVENT_END = 3
+
+
+entries = defaultdict(list)
+pid_file_info = {}
+
+def print_event(cpu, data, size):
+    event = b["events"].event(data)
+    global initial_ts
+
+    if event.type == EventType.EVENT_ENTRY:
+        entries[event.id].append(event.name)
+        return
+
+    is_open_end = args.full_path and event.type == EventType.EVENT_END
+    is_regular_open = not args.full_path and event.type == EventType.EVENT_OPEN
+
+    if is_regular_open or is_open_end:
+        if event.ret >= 0:
+            pid = event.id >> 32
+            path = b""
+            if not args.full_path:
+                path = event.name
+            else:
+                paths = entries.get(event.id, [])
+                paths.reverse()
+                path = os.path.join(*paths)
+
+            if path:
+                try:
+                    path_str = path.decode('utf-8', 'surrogateescape')
+                    p = Path(path_str)
+                    if p.is_file():
+                        initial_size = p.stat().st_size
+                        with open(path_str, "rb") as f:
+                            content = f.read()
+                        initial_checksum = calculate_full_adler32(content)
+                        pid_file_info[pid] = (path_str, initial_size, initial_checksum)
+                except (FileNotFoundError, PermissionError, OSError):
+                    pass
+        if args.full_path and event.id in entries:
+            del entries[event.id]
+        return
+
+    if event.type == EventType.EVENT_CLOSE:
+        if args.name and bytes(args.name) not in event.comm:
+            return
+
+        if not initial_ts:
+            initial_ts = event.ts
+
+        pid = event.id >> 32
+
+        if args.timestamp:
+            delta = event.ts - initial_ts
+            printb(b"%-14.9f" % (float(delta) / 1000000), nl="")
+
+        if args.print_uid:
+            printb(b"%-6d" % event.uid, nl="")
+
+        tid_or_pid = event.id & 0xffffffff if args.tid else pid
+
+        printb(b"%-6d %-16s %-7s %4d %3d " %
+               (tid_or_pid, event.comm, b"CLOSE", event.ret, 0), nl="")
+
+        hash_field = b"-"
+        status_field = b"UNTRACKED OPEN"
+        path_bytes = b"-"
+
+        if pid in pid_file_info:
+            path_str, initial_size, initial_checksum = pid_file_info[pid]
+            path_bytes = path_str.encode('utf-8', 'surrogateescape')
+
+            try:
+                p = Path(path_str)
+                if p.is_file():
+                    current_size = p.stat().st_size
+
+                    if current_size != initial_size:
+                        with open(path_str, "rb") as f:
+                            content = f.read()
+                        new_checksum = calculate_full_adler32(content)
+                        hash_field = format(new_checksum, '08x').encode('ascii')
+                        status_field = b"MODIFIED (SIZE CHANGE)"
+                    else:
+                        with open(path_str, "rb") as f:
+                            content = f.read()
+                        new_checksum = calculate_full_adler32(content)
+
+                        if new_checksum != initial_checksum:
+                            hash_field = format(new_checksum, '08x').encode('ascii')
+                            status_field = b"MODIFIED (IN-PLACE)"
+                        else:
+                            hash_field = format(initial_checksum, '08x').encode('ascii')
+                            status_field = b"UNCHANGED"
+                else:
+                    status_field = b"DELETED"
+                    hash_field = format(initial_checksum, '08x').encode('ascii')
+
+            except (FileNotFoundError, PermissionError, OSError) as e:
+                status_field = b"ERROR ACCESSING FILE"
+
+            del pid_file_info[pid]
+
+        printb(b"%-10s %-22s %s" % (hash_field, status_field, path_bytes))
+
+
+b["events"].open_perf_buffer(print_event, page_cnt=args.buffer_pages)
+start_time = datetime.now()
+while not args.duration or datetime.now() - start_time < args.duration:
+    try:
+        b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()
